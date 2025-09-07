@@ -1,0 +1,922 @@
+import pygame
+import os
+import sys
+import json
+import subprocess
+import time
+import threading
+import re
+from features import (
+    lecture_voix_haute,
+    exporter_conversation,
+    afficher_sources,
+    ajouter_document_temporaire,
+    appeler_oracle
+)
+
+pygame.init()
+pygame.display.set_caption("DecentrIA Maquette")
+
+# Création du fichier historique s'il n'existe pas
+HISTORIQUE_PATH = "historique_conversation.txt"
+
+if not os.path.exists(HISTORIQUE_PATH):
+    with open(HISTORIQUE_PATH, "w", encoding="utf-8") as f:
+        f.write("")  # Fichier vide
+
+def limiter_historique(prompt_path, max_pairs=2):
+    """Limite l'historique de conversation pour économiser des tokens"""
+    try:
+        with open(prompt_path, 'r', encoding='utf-8', errors='replace') as f:
+            data = json.load(f)
+
+        messages = data.get("messages", [])
+
+        # On garde uniquement les max_pairs * 2 derniers messages (user + assistant)
+        max_messages = max_pairs * 2
+        messages = messages[-max_messages:]
+
+        data["messages"] = messages
+
+        with open(prompt_path, 'w', encoding='utf-8', errors='replace') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Erreur lors de la limitation de l'historique: {e}")
+
+def nettoyer_et_formater_texte(texte):
+    """Nettoie le texte et supprime les répétitions et caractères invalides"""
+    if not texte:
+        return ""
+    
+    # Conversion en string si ce n'est pas déjà le cas
+    if not isinstance(texte, str):
+        try:
+            texte = str(texte)
+        except:
+            texte = ""
+    
+    # Suppression des caractères nuls et autres caractères problématiques
+    texte = ''.join(char for char in texte if ord(char) >= 32 or ord(char) == 10 or ord(char) == 13)
+    
+    # Suppression des motifs parasites
+    texte = re.sub(r'#+\s*', '', texte)  # Enlève les ###
+    texte = re.sub(r'LIP\s*', '', texte)  # Enlève les LIP
+    texte = re.sub(r'\s*-\s*-\s*', ' - ', texte)  # Nettoie les tirets
+    
+    # Suppression des répétitions
+    lignes = texte.split('\n')
+    lignes_uniques = []
+    derniere_ligne = ""
+    
+    for ligne in lignes:
+        ligne = ligne.strip()
+        if ligne and ligne != derniere_ligne:  # Évite les lignes vides et les répétitions
+            lignes_uniques.append(ligne)
+            derniere_ligne = ligne
+    
+    texte = '\n'.join(lignes_uniques)
+    
+    # Détection des sections
+    sections = re.split(r'(?<=\n)(?=\w)', texte)  # Détecte les nouvelles sections
+    
+    # Formatage des paragraphes
+    paragraphes = []
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+            
+        # Détection des listes à puces
+        if re.match(r'^\d+\.', section) or re.match(r'^-\s', section):
+            paragraphes.append(section)
+        else:
+            # Découpage en lignes de 80 caractères max
+            lines = []
+            current_line = []
+            for word in section.split():
+                if len(' '.join(current_line + [word])) > 80:
+                    lines.append(' '.join(current_line))
+                    current_line = [word]
+                else:
+                    current_line.append(word)
+            if current_line:
+                lines.append(' '.join(current_line))
+            paragraphes.append('\n'.join(lines))
+    
+    return '\n\n'.join(paragraphes)
+
+# Chargement du fond
+try:
+    background = pygame.image.load("background.png")
+    screen_width, screen_height = background.get_size()
+    screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+except Exception as e:
+    print(f"Erreur lors du chargement de l'image de fond: {e}")
+    screen_width, screen_height = 1920, 1080
+    screen = pygame.display.set_mode((screen_width, screen_height), pygame.RESIZABLE)
+    background = pygame.Surface((screen_width, screen_height))
+    background.fill((0, 0, 50))
+
+# Création d'une surface floutée pour le fond
+try:
+    blurred_bg = pygame.transform.scale(background, (screen_width//6, screen_height//6))
+    blurred_bg = pygame.transform.scale(blurred_bg, (screen_width, screen_height))
+    blurred_bg.set_alpha(100)
+except:
+    blurred_bg = pygame.Surface((screen_width, screen_height))
+    blurred_bg.fill((0, 0, 50, 100))
+
+# Police
+font_path = os.path.join("fonts", "Orbitron-VariableFont_wght.ttf")
+try:
+    font = pygame.font.Font(font_path, 22)
+except:
+    font = pygame.font.SysFont("arial", 22)
+
+# Couleurs
+BLEU_CLAIR = (0, 255, 255)
+BLEU_DECENTRIA = (0, 180, 255)
+NOIR = (0, 0, 0)
+GRIS_HIST = (100, 100, 100)
+FOND_TRANSPARENT = (30, 30, 50, 180)
+
+# Images
+try:
+    param_btn = pygame.image.load("parametre_bouton.png").convert_alpha()
+    param_btn_hover = pygame.image.load("parametre_bouton_hover.png").convert_alpha()
+    croix_img = pygame.image.load("close_btn.png").convert_alpha()
+    connect_wallet_img = pygame.image.load("connect_wallet.png").convert_alpha()
+    connect_wallet_hover_img = pygame.image.load("connect_wallet_hover.png").convert_alpha()
+    connect_wallet_img = pygame.transform.scale(connect_wallet_img, (250, 100))
+    connect_wallet_hover_img = pygame.transform.scale(connect_wallet_hover_img, (250, 100))
+except Exception as e:
+    print(f"Erreur lors du chargement des images: {e}")
+    # Création de boutons de secours
+    param_btn = pygame.Surface((50, 50), pygame.SRCALPHA)
+    pygame.draw.rect(param_btn, BLEU_CLAIR, (0, 0, 50, 50), 2, border_radius=5)
+    param_btn_hover = pygame.Surface((50, 50), pygame.SRCALPHA)
+    pygame.draw.rect(param_btn_hover, BLEU_DECENTRIA, (0, 0, 50, 50), 2, border_radius=5)
+    croix_img = pygame.Surface((30, 30), pygame.SRCALPHA)
+    pygame.draw.line(croix_img, BLEU_CLAIR, (0, 0), (30, 30), 2)
+    pygame.draw.line(croix_img, BLEU_CLAIR, (30, 0), (0, 30), 2)
+    connect_wallet_img = pygame.Surface((250, 100), pygame.SRCALPHA)
+    pygame.draw.rect(connect_wallet_img, BLEU_CLAIR, (0, 0, 250, 100), 2, border_radius=10)
+    connect_wallet_hover_img = pygame.Surface((250, 100), pygame.SRCALPHA)
+    pygame.draw.rect(connect_wallet_hover_img, BLEU_DECENTRIA, (0, 0, 250, 100), 2, border_radius=10)
+
+# Boutons personnalisés
+boutons = {
+    "pj_bouton": ("pj_bouton.png", "pj_bouton_hover.png", 50, 670, 264, 240),
+    "oracle_bouton": ("oracle_bouton.png", "oracle_bouton_hover.png", 254, 666, 244, 235),
+    "source_bouton": ("source_bouton.png", "source_bouton_hover.png", 399, 673, 299, 240),
+    "vocal_bouton": ("vocal_bouton.png", "vocal_bouton_hover.png", 608, 668, 259, 235),
+    "exporter_bouton": ("exporter_bouton.png", "exporter_bouton_hover.png", 766, 657, 269, 245)
+}
+
+# Positions & dimensions
+try:
+    with open("gui_positions.json", "r", encoding="utf-8", errors="replace") as f:
+        positions = json.load(f)
+    with open("gui_dimensions.json", "r", encoding="utf-8", errors="replace") as f:
+        dimensions = json.load(f)
+except Exception as e:
+    print(f"Erreur lors du chargement des positions/dimensions: {e}")
+    positions = {
+        "parametre_bouton.png": {"x": 10, "y": 10},
+    }
+    dimensions = {
+        "parametre_bouton.png": {"width": 50, "height": 50},
+    }
+
+def make_rect(name):
+    return pygame.Rect(
+        positions.get(name, {}).get("x", 0),
+        positions.get(name, {}).get("y", 0),
+        dimensions.get(name, {}).get("width", 50),
+        dimensions.get(name, {}).get("height", 50)
+    )
+
+param_rect = make_rect("parametre_bouton.png")
+cross_rect = pygame.Rect(260, 10, 30, 30)
+connect_wallet_rect = connect_wallet_img.get_rect(topleft=(1550, 8))
+
+# Menus
+top_menu_labels = {"FR": ["HISTORIQUE"], "EN": ["HISTORY"]}
+bottom_menu = {
+    "FR": ["RGPD", "CGU", "FAQ", "À PROPOS", "NOUS CONTACTER"],
+    "EN": ["GDPR", "TOS", "FAQ", "ABOUT", "CONTACT US"]
+}
+
+# Fichiers de contrôle
+language_file = "language_selected.flag"
+unlock_file = "wallet_unlock.flag"
+features_file = "features_unlocked.flag"
+
+# États
+current_language = "FR"
+show_column = False
+language_menu_open = False
+hover_param = False
+top_rects = []
+bottom_rects = []
+wallet_unlocked = False
+welcome_popup_launched = False
+features_unlocked = True
+visited_popups = set()
+visite_en_cours = True
+
+# Nettoyage au démarrage
+if os.path.exists(language_file):
+    try:
+        os.remove(language_file)
+    except:
+        pass
+if os.path.exists(unlock_file):
+    try:
+        os.remove(unlock_file)
+    except:
+        pass
+
+# Lancement du sélecteur de langue
+try:
+    subprocess.Popen(["python3", "popup_language_selector.py"])
+except:
+    print("Impossible de lancer le sélecteur de langue")
+
+class OutputReaderThread(threading.Thread):
+    def __init__(self, filepath, callback):
+        super().__init__()
+        self.filepath = filepath
+        self.callback = callback
+        self._running = True
+        self._last_content = ""
+
+    def run(self):
+        while self._running:
+            try:
+                if os.path.exists(self.filepath):
+                    with open(self.filepath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read().strip()
+                        if content and content != self._last_content:
+                            self._last_content = content
+                            self.callback(content)
+            except Exception as e:
+                print(f"Erreur lecture fichier: {e}")
+            time.sleep(0.2)
+
+    def stop(self):
+        self._running = False
+        self.join()
+
+class ReponseWindow:
+    def __init__(self):
+        self.rect = pygame.Rect(1043, 300, 720, 119)
+        self.initial_height = 119
+        self.target_height = 645
+        self.current_height = 119
+        self.text = ""
+        self.display_text = ""
+        self.formatted_text = []
+        try:
+            self.font = pygame.font.Font(font_path, 22)
+        except:
+            self.font = pygame.font.SysFont("arial", 22)
+        self.animation_speed = 5
+        self.text_speed = 5
+        self.last_char_time = 0
+        self.char_index = 0
+        self.visible = False
+        self.animation_complete = False
+        self.text_complete = False
+        self.line_spacing = 30
+        self.scroll_offset = 0
+        self.max_scroll_offset = 0
+        self.scroll_speed = 30
+        self.border_radius = 15
+        self.alpha = 0
+        self.waiting_message = "Un petit instant, la réponse émerge du silence des étoiles..."
+        self.reader_thread = None
+        self.max_line_width = self.rect.width - 40
+        self.scroll_bar_rect = None
+        self.dragging_scroll = False
+        self.growing = False
+        self.waiting_message_shown = False
+        self.btn_nouvelle_question_rect = pygame.Rect(self.rect.x + self.rect.width - 200, self.rect.y + self.rect.height + 10, 180, 40)
+        self.btn_visible = False
+        self.allow_scroll = True
+
+    def clear_output_file(self):
+        try:
+            with open("output.txt", "w", encoding="utf-8", errors="replace") as f:
+                f.write("")
+        except Exception as e:
+            print(f"Erreur lors de l'effacement du fichier output: {e}")
+        
+    def start_animation(self):
+        self.clear_output_file()
+        self.visible = True
+        self.animation_complete = False
+        self.text_complete = False
+        self.current_height = self.initial_height
+        self.display_text = self.waiting_message
+        self.text = ""
+        self.formatted_text = []
+        self.last_char_time = pygame.time.get_ticks()
+        self.alpha = 0
+        self.growing = False
+        self.waiting_message_shown = True
+        self.btn_visible = False
+        self.scroll_offset = 0
+        self.allow_scroll = True
+        
+        if self.reader_thread:
+            self.reader_thread.stop()
+        self.reader_thread = OutputReaderThread("output.txt", self.update_text)
+        self.reader_thread.start()
+        
+    def update_text(self, new_text):
+        try:
+            if not isinstance(new_text, str):
+                new_text = str(new_text)
+                
+            texte_propre = nettoyer_et_formater_texte(new_text)
+            self.text = texte_propre
+            self.display_text = texte_propre
+            self._format_text()
+            self.text_complete = True
+            self.waiting_message_shown = False
+            self.growing = True
+            self._calculate_max_scroll()
+            self.btn_visible = True
+            self.scroll_offset = 0
+            
+            with open(HISTORIQUE_PATH, "a", encoding="utf-8", errors="replace") as f:
+                f.write(self.text + "\n")
+        except Exception as e:
+            print(f"Erreur lors de la mise à jour du texte: {e}")
+            self.text = "Erreur lors du chargement de la réponse"
+            self.display_text = self.text
+            self._format_text()
+            self.text_complete = True
+            self.waiting_message_shown = False
+            self.growing = True
+            self._calculate_max_scroll()
+            self.btn_visible = True
+            self.scroll_offset = 0
+    
+    def _calculate_max_scroll(self):
+        total_height = sum(len(paragraph) * self.line_spacing for paragraph in self.formatted_text)
+        visible_height = self.current_height - 40
+        self.max_scroll_offset = max(0, total_height - visible_height + 20)
+    
+    def _format_text(self):
+        self.formatted_text = []
+        max_width = self.rect.width - 40
+        
+        try:
+            text_to_format = self.text if self.text else ""
+            for paragraph in text_to_format.split('\n\n'):
+                paragraph_lines = []
+                for line in paragraph.split('\n'):
+                    line = ''.join(char for char in line if ord(char) >= 32 or ord(char) == 10)
+                    words = line.split()
+                    current_line = ""
+                    
+                    for word in words:
+                        test_line = f"{current_line} {word}".strip() if current_line else word
+                        test_width = self.font.size(test_line)[0]
+                        
+                        if test_width <= max_width:
+                            current_line = test_line
+                        else:
+                            if current_line:
+                                paragraph_lines.append(current_line)
+                            current_line = word
+                    
+                    if current_line:
+                        paragraph_lines.append(current_line)
+                
+                self.formatted_text.append(paragraph_lines)
+        except Exception as e:
+            print(f"Erreur lors du formatage du texte: {e}")
+            self.formatted_text = [["Erreur d'affichage du texte"]]
+    
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.scroll_bar_rect and self.scroll_bar_rect.collidepoint(event.pos) and self.allow_scroll:
+                self.dragging_scroll = True
+            elif self.btn_visible and self.btn_nouvelle_question_rect.collidepoint(event.pos):
+                return "nouvelle_question"
+                
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging_scroll = False
+            
+        elif event.type == pygame.MOUSEMOTION and self.dragging_scroll and self.allow_scroll:
+            scroll_area_height = self.current_height - 40
+            mouse_y_relative = event.pos[1] - self.rect.y - 20
+            self.scroll_offset = int((mouse_y_relative / scroll_area_height) * self.max_scroll_offset)
+            self.scroll_offset = max(0, min(self.scroll_offset, self.max_scroll_offset))
+    
+    def update(self):
+        if self.growing and not self.animation_complete and self.visible:
+            self.current_height = min(self.current_height + self.animation_speed, self.target_height)
+            self.alpha = min(180, self.alpha + 5)
+            if self.current_height >= self.target_height:
+                self.animation_complete = True
+            self._calculate_max_scroll()
+        
+        mouse_pos = pygame.mouse.get_pos()
+        if self.rect.collidepoint(mouse_pos) and self.allow_scroll:
+            for event in pygame.event.get(pygame.MOUSEWHEEL):
+                if event.y > 0:
+                    self.scroll_offset = max(0, self.scroll_offset - self.scroll_speed)
+                elif event.y < 0:
+                    self.scroll_offset = min(self.max_scroll_offset, self.scroll_offset + self.scroll_speed)
+        
+        self.btn_nouvelle_question_rect.y = self.rect.y + self.current_height + 10
+    
+    def draw(self, surface):
+        if not self.visible:
+            return
+            
+        bg_rect = pygame.Rect(self.rect.x, self.rect.y, self.rect.width, self.current_height)
+        surface.blit(blurred_bg, bg_rect, bg_rect)
+        
+        overlay = pygame.Surface((self.rect.width, self.current_height), pygame.SRCALPHA)
+        overlay.fill((40, 40, 60, 80))
+        surface.blit(overlay, self.rect.topleft)
+        
+        border_surface = pygame.Surface((self.rect.width, self.current_height), pygame.SRCALPHA)
+        pygame.draw.rect(border_surface, (*BLEU_CLAIR, self.alpha), 
+                        (0, 0, self.rect.width, self.current_height), 
+                        2, border_radius=self.border_radius)
+        surface.blit(border_surface, self.rect.topleft)
+        
+        content_surface = pygame.Surface((self.rect.width - 40, self.current_height - 40), pygame.SRCALPHA)
+        content_surface.fill((0, 0, 0, 0))
+        
+        y_offset = -self.scroll_offset
+        max_visible_height = self.current_height - 40
+        
+        if self.waiting_message_shown or not self.text_complete:
+            text_surface = self.font.render(self.waiting_message, True, BLEU_CLAIR)
+            text_rect = text_surface.get_rect(center=(content_surface.get_width()//2, 
+                                      content_surface.get_height()//2))
+            content_surface.blit(text_surface, text_rect)
+        else:
+            for paragraph in self.formatted_text:
+                for line in paragraph:
+                    if y_offset + self.line_spacing < 0:
+                        y_offset += self.line_spacing
+                        continue
+                    if y_offset > max_visible_height:
+                        break
+                    
+                    try:
+                        text_surface = self.font.render(line, True, BLEU_CLAIR)
+                        content_surface.blit(text_surface, (0, y_offset))
+                    except:
+                        pass
+                    y_offset += self.line_spacing
+                
+                y_offset += self.line_spacing // 2
+        
+        mask = pygame.Surface((self.rect.width - 40, self.current_height - 40), pygame.SRCALPHA)
+        pygame.draw.rect(mask, (255, 255, 255, 255), (0, 0, self.rect.width - 40, self.current_height - 40), 
+                        border_radius=self.border_radius)
+        content_surface.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        
+        surface.blit(content_surface, (self.rect.x + 20, self.rect.y + 20))
+        
+        if self.text_complete and self.max_scroll_offset > 0 and self.current_height > self.initial_height and self.allow_scroll:
+            scroll_area_height = self.current_height - 40
+            scroll_bar_height = max(20, int((scroll_area_height / (self.max_scroll_offset + scroll_area_height)) * scroll_area_height))
+            scroll_pos = (self.scroll_offset / self.max_scroll_offset) * (scroll_area_height - scroll_bar_height)
+            
+            scroll_bar_x = self.rect.right - 15
+            scroll_bar_y = self.rect.y + 20 + scroll_pos
+            
+            pygame.draw.rect(surface, (*BLEU_CLAIR, 100), 
+                           (scroll_bar_x - 3, self.rect.y + 20, 6, scroll_area_height), 
+                           border_radius=3)
+            
+            self.scroll_bar_rect = pygame.Rect(scroll_bar_x - 5, scroll_bar_y, 10, scroll_bar_height)
+            pygame.draw.rect(surface, BLEU_CLAIR, self.scroll_bar_rect, border_radius=5)
+        
+        if self.text_complete and self.btn_visible:
+            pygame.draw.rect(surface, BLEU_DECENTRIA, self.btn_nouvelle_question_rect, border_radius=10)
+            btn_font = pygame.font.Font(font_path, 20) if os.path.exists(font_path) else pygame.font.SysFont("arial", 20)
+            btn_text = btn_font.render("Nouvelle question", True, NOIR)
+            text_rect = btn_text.get_rect(center=self.btn_nouvelle_question_rect.center)
+            surface.blit(btn_text, text_rect)
+
+class QuestionField:
+    def __init__(self, x, y, width, height):
+        self.rect = pygame.Rect(x, y, width, height)
+        self.default_text = "Tout commence par une question..."
+        self.user_text = ""
+        self.active = False
+        self.has_typed = False
+        self.waiting_response = False
+        try:
+            self.font = pygame.font.Font(font_path, 22)
+        except:
+            self.font = pygame.font.SysFont("arial", 22)
+        self.base_height = 119
+        self.min_height = 119
+        self.max_height = 300
+        self.line_spacing = 30
+        self.scroll_offset = 0
+        self.border_radius = 15
+        self.messages = []
+        self.max_message_pairs = 2
+        
+    def update_size(self):
+        lines = self._get_text_lines()
+        needed_height = len(lines) * self.line_spacing + 20
+        self.rect.height = max(self.min_height, min(needed_height, self.max_height))
+        
+    def _get_text_lines(self):
+        text = self.user_text if (self.active or self.has_typed or self.waiting_response) else self.default_text
+        if not text:
+            return []
+        
+        words = text.split(' ')
+        lines = []
+        current_line = []
+        max_width = self.rect.width - 40
+        
+        for word in words:
+            word_width = self.font.size(word)[0]
+            
+            if word_width > max_width:
+                split_word = []
+                current_part = ""
+                for char in word:
+                    test_part = current_part + char
+                    if self.font.size(test_part)[0] <= max_width:
+                        current_part = test_part
+                    else:
+                        split_word.append(current_part)
+                        current_part = char
+                if current_part:
+                    split_word.append(current_part)
+                
+                for part in split_word:
+                    lines.append(part)
+                continue
+            
+            test_line = ' '.join(current_line + [word])
+            test_width = self.font.size(test_line)[0]
+            
+            if test_width <= max_width:
+                current_line.append(word)
+            else:
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        return lines
+        
+    def handle_event(self, event):
+        if len(visited_popups) >= 5:
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if self.rect.collidepoint(event.pos):
+                    self.active = True
+                    if not self.has_typed:
+                        self.user_text = ""
+                    self.scroll_offset = 0
+                else:
+                    self.active = False
+                    if not self.user_text:
+                        self.has_typed = False
+                    
+            elif event.type == pygame.KEYDOWN and self.active and not self.waiting_response:
+                self.has_typed = True
+                if event.key == pygame.K_RETURN:
+                    question = self.user_text.strip()
+                    if question:
+                        try:
+                            if os.path.exists("output.txt"):
+                                with open("output.txt", "r", encoding="utf-8", errors="replace") as f:
+                                    last_answer = f.read().strip()
+                                    if last_answer:
+                                        self.messages.append({
+                                            "role": "assistant",
+                                            "content": last_answer
+                                        })
+
+                            self.messages.append({
+                                "role": "user",
+                                "content": question
+                            })
+
+                            if len(self.messages) > self.max_message_pairs * 2:
+                                self.messages = self.messages[-(self.max_message_pairs * 2):]
+
+                            with open("prompt.txt", "w", encoding="utf-8", errors="replace") as f:
+                                json.dump({"messages": self.messages}, f, ensure_ascii=False, indent=2)
+                            
+                            limiter_historique("prompt.txt", max_pairs=self.max_message_pairs)
+                            
+                            with open(HISTORIQUE_PATH, "a", encoding="utf-8", errors="replace") as f:
+                                f.write(f"Utilisateur : {question}\nDecentrIA :\n")
+                            
+                            self.waiting_response = True
+                            self.scroll_offset = 0
+                            self.update_size()
+                            
+                            reponse_window.start_animation()
+                            script_dir = os.path.dirname(os.path.abspath(__file__))
+                            script_path = os.path.join(script_dir, "decentria_llm_runner.sh")
+                            try:
+                                subprocess.Popen([script_path], cwd=script_dir)
+                            except Exception as e:
+                                print(f"Erreur lors du lancement du script: {e}")
+                        except Exception as e:
+                            print(f"Erreur lors de l'envoi de la question: {e}")
+                elif event.key == pygame.K_BACKSPACE:
+                    self.user_text = self.user_text[:-1]
+                    if not self.user_text:
+                        self.has_typed = False
+                    self.scroll_offset = 0
+                else:
+                    self.user_text += event.unicode
+                self.update_size()
+
+    def draw(self, surface):
+        if len(visited_popups) >= 5:
+            bg_rect = pygame.Rect(self.rect.x, self.rect.y, self.rect.width, self.rect.height)
+            surface.blit(blurred_bg, bg_rect, bg_rect)
+            
+            border_surface = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
+            pygame.draw.rect(border_surface, (*BLEU_CLAIR, 200), 
+                           (0, 0, self.rect.width, self.rect.height), 
+                           2, border_radius=self.border_radius)
+            surface.blit(border_surface, self.rect.topleft)
+            
+            lines = self._get_text_lines()
+            
+            max_visible_lines = (self.rect.height - 20) // self.line_spacing
+            total_lines = len(lines)
+            
+            if total_lines > max_visible_lines:
+                self.scroll_offset = max(0, min(self.scroll_offset, total_lines - max_visible_lines))
+                start_line = self.scroll_offset
+            else:
+                start_line = 0
+            
+            for i, line in enumerate(lines[start_line:start_line + max_visible_lines]):
+                try:
+                    text_surface = self.font.render(line, True, BLEU_CLAIR)
+                    if i == 0 and not (self.active or self.has_typed or self.waiting_response):
+                        text_rect = text_surface.get_rect(
+                            x=self.rect.x + 20,
+                            centery=self.rect.y + self.rect.height // 2
+                        )
+                    else:
+                        text_rect = text_surface.get_rect(
+                            x=self.rect.x + 20,
+                            y=self.rect.y + 10 + i * self.line_spacing
+                        )
+                    surface.blit(text_surface, text_rect)
+                except:
+                    pass
+            
+            if total_lines > max_visible_lines:
+                try:
+                    scroll_indicator = self.font.render("↓", True, BLEU_CLAIR)
+                    surface.blit(scroll_indicator, (self.rect.right - 25, self.rect.bottom - 25))
+                except:
+                    pass
+
+# Création des éléments d'interface
+question_field = QuestionField(1043, 144, 720, 119)
+reponse_window = ReponseWindow()
+
+def check_response_ready():
+    if reponse_window.visible and not reponse_window.text_complete and os.path.exists("output.txt"):
+        try:
+            with open("output.txt", "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            if content:
+                reponse_window.update_text(content)
+                return True
+        except:
+            pass
+    return False
+
+def reset_conversation():
+    try:
+        with open(HISTORIQUE_PATH, "w", encoding="utf-8", errors="replace") as f:
+            f.write("")
+    except:
+        pass
+    reponse_window.text = ""
+    reponse_window.display_text = ""
+    reponse_window.formatted_text = []
+    question_field.messages = []
+
+clock = pygame.time.Clock()
+running = True
+
+while running:
+    try:
+        screen_width, screen_height = screen.get_size()
+        screen.blit(pygame.transform.scale(background, (screen_width, screen_height)), (0, 0))
+
+        mouse_pos = pygame.mouse.get_pos()
+
+        if not show_column:
+            hover_param = param_rect.collidepoint(mouse_pos)
+            if not features_unlocked or show_column:
+                hover_param = False
+            screen.blit(pygame.transform.scale(
+                param_btn_hover if hover_param else param_btn,
+                (param_rect.width, param_rect.height)
+            ), (param_rect.x, param_rect.y))
+
+        if wallet_unlocked:
+            if connect_wallet_rect.collidepoint(mouse_pos):
+                screen.blit(connect_wallet_hover_img, connect_wallet_rect.topleft)
+            else:
+                screen.blit(connect_wallet_img, connect_wallet_rect.topleft)
+
+        for name, (img_file, hover_file, x, y, w, h) in boutons.items():
+            rect = pygame.Rect(x, y, w, h)
+            try:
+                img = pygame.image.load(hover_file if rect.collidepoint(mouse_pos) else img_file).convert_alpha()
+                img = pygame.transform.scale(img, (w, h))
+                screen.blit(img, (x, y))
+            except:
+                pass
+
+        if show_column:
+            flou_surface = pygame.Surface((300, screen_height), pygame.SRCALPHA)
+            flou_surface.fill((0, 0, 0, 200))
+            screen.blit(flou_surface, (0, 0))
+            screen.blit(pygame.transform.scale(croix_img, (30, 30)), (cross_rect.x, cross_rect.y))
+
+            top_rects.clear()
+            y_offset = 50
+
+            for label in top_menu_labels[current_language]:
+                if label in ["HISTORIQUE", "HISTORY"]:
+                    rect = pygame.Rect(30, y_offset, 200, 30)
+                    try:
+                        text = font.render(label, True, GRIS_HIST)
+                        screen.blit(text, rect.topleft)
+                        top_rects.append((label, rect))
+                    except:
+                        pass
+                    y_offset += 30
+
+            y_offset = screen_height - 60 * len(bottom_menu[current_language]) - 40
+            bottom_rects.clear()
+            for item in bottom_menu[current_language]:
+                try:
+                    text = font.render(item, True, BLEU_CLAIR)
+                    rect = text.get_rect(topleft=(30, y_offset))
+                    screen.blit(text, rect.topleft)
+                    bottom_rects.append((item, rect))
+                except:
+                    pass
+                y_offset += 60
+
+        question_field.draw(screen)
+        
+        reponse_window.update()
+        reponse_window.draw(screen)
+        
+        check_response_ready()
+
+        if not welcome_popup_launched and os.path.exists(language_file):
+            try:
+                with open(language_file, "r") as f:
+                    current_language = f.read().strip()
+                subprocess.Popen(["python3", "popup_welcome_en.py" if current_language == "EN" else "popup_welcome.py"])
+                welcome_popup_launched = True
+            except:
+                pass
+
+        if os.path.exists(unlock_file):
+            wallet_unlocked = True
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                if reponse_window.reader_thread:
+                    reponse_window.reader_thread.stop()
+
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+                if reponse_window.reader_thread:
+                    reponse_window.reader_thread.stop()
+
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if param_rect.collidepoint(event.pos) and not show_column:
+                    if features_unlocked:
+                        show_column = True
+                elif connect_wallet_rect.collidepoint(event.pos) and wallet_unlocked:
+                    script = "popup_dec_connect_en.py" if current_language == "EN" else "popup_dec_connect.py"
+                    try:
+                        subprocess.Popen(["python3", script])
+                    except:
+                        pass
+                elif show_column:
+                    if cross_rect.collidepoint(event.pos):
+                        show_column = False
+                        language_menu_open = False
+                    else:
+                        for text, rect in top_rects:
+                            if rect.collidepoint(event.pos):
+                                if text in ["LANGAGE", "LANGUAGE"]:
+                                    language_menu_open = not language_menu_open
+                                elif text.startswith("LANG_OPTION_"):
+                                    current_language = text[-2:]
+                                    language_menu_open = False
+
+                        for text, rect in bottom_rects:
+                            if rect.collidepoint(event.pos):
+                                fichier = {
+                                    "FR": {
+                                        "NOUS CONTACTER": "fenetre_nous_contacter.py",
+                                        "À PROPOS": "fenetre_a_propos.py",
+                                        "FAQ": "fenetre_FAQ.py",
+                                        "RGPD": "fenetre_rgpd.py",
+                                        "CGU": "fenetre_CGU.py"
+                                    },
+                                    "EN": {
+                                        "CONTACT US": "fenetre_nous_contacter_en.py",
+                                        "ABOUT": "fenetre_a_propos_en.py",
+                                        "FAQ": "fenetre_FAQ_en.py",
+                                        "GDPR": "fenetre_rgpd_en.py",
+                                        "TOS": "fenetre_CGU_en.py"
+                                    }
+                                }[current_language].get(text, None)
+                                if fichier:
+                                    try:
+                                        subprocess.Popen(["python3", fichier])
+                                    except:
+                                        pass
+                                if text in ["HISTORIQUE", "HISTORY"]:
+                                    reset_conversation()
+                else:
+                    for name in boutons:
+                        bx, by, bw, bh = boutons[name][2:]
+                        if pygame.Rect(bx, by, bw, bh).collidepoint(event.pos):
+
+                            if visite_en_cours:
+                                if name not in visited_popups:
+                                    fichier = f"popup_{name.replace('_bouton','')}_en.py" if current_language == "EN" else f"popup_{name.replace('_bouton','')}.py"
+                                    try:
+                                        subprocess.Popen(["python3", fichier])
+                                        visited_popups.add(name)
+                                    except:
+                                        pass
+
+                                if len(visited_popups) >= 5:
+                                    visite_en_cours = False
+                                    question_field.active = False
+                                    question_field.user_text = ""
+                                    question_field.update_size()
+                                    print("✅ Visite terminée. Les fonctions sont désormais activées.")
+
+                            else:
+                                if name == "vocal_bouton":
+                                    lecture_voix_haute(reponse_window.text)
+
+                                elif name == "exporter_bouton":
+                                    exporter_conversation(question_field.user_text, reponse_window.text)
+
+                                elif name == "source_bouton":
+                                    afficher_sources(["Document simulé 1", "Document simulé 2", "Document simulé 3"])
+
+                                elif name == "oracle_bouton":
+                                    nouvelle_rep = appeler_oracle(question_field.user_text)
+                                    reponse_window.update_text(nouvelle_rep)
+
+                                elif name == "pj_bouton":
+                                    ajouter_document_temporaire("mon_fichier.txt")
+            
+            result = reponse_window.handle_event(event)
+            if result == "nouvelle_question":
+                question_field.user_text = ""
+                question_field.active = True
+                question_field.waiting_response = False
+                question_field.update_size()
+                reponse_window.btn_visible = False
+                
+            question_field.handle_event(event)
+
+        pygame.display.flip()
+        clock.tick(60)
+    except Exception as e:
+        print(f"Erreur dans la boucle principale: {e}")
+        running = False
+
+pygame.quit()
+sys.exit()
