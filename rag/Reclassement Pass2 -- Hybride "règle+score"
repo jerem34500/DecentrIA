@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Reclassement Pass2 — Animals/needs_review -> {birds, fish, insects_arachnids, mammals,
+marine_animals, reptiles_amphibians, ethology_vet, prehistoric, mythical, needs_review}
+
+Approche hybride "règles + score" 100% offline, sans dépendances externes.
+"""
+
+import os, re, shutil, unicodedata
+from collections import defaultdict, Counter
+
+# === [PARAMÈTRES À ADAPTER] ===================================================
+BASE_DIR = "/home/jerem/Bureau/DecentrIA/DecentrIA_NEW_RAG/zim_extract/work/subcats_pass1/Animals"  # <— adapte ce chemin
+SRC_SUBFOLDER = "needs_review"
+DEST_SUBFOLDERS = [
+    "birds","fish","insects_arachnids","mammals","marine_animals",
+    "reptiles_amphibians","ethology_vet","prehistoric","mythical","needs_review"
+]
+# Garde-fous
+SEUIL_MIN = 2.0      # score minimal requis pour déplacer
+MARGE_MIN = 1.0      # écart minimal entre 1er et 2e score
+MAX_BYTES = 200_000  # lecture partielle par fichier
+DRY_RUN = True       # True = simulation ; False = déplacer les fichiers
+# ==============================================================================
+
+# Utilitaires
+def normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    return text.lower()
+
+def read_head(path: str, nbytes=MAX_BYTES) -> str:
+    try:
+        with open(path, "rb") as f:
+            blob = f.read(nbytes)
+        try:
+            return blob.decode("utf-8", errors="ignore")
+        except:
+            return blob.decode("latin-1", errors="ignore")
+    except Exception:
+        return ""
+
+# Détection très simple des binominaux latins (Genus species)
+BINOMIAL_RE = re.compile(r"\b([A-Z][a-z]+)\s+([a-z]{2,})\b")
+
+# Vocabulaires (pondérations)
+W = dict(
+    STRONG=2.0, MED=1.2, WEAK=0.6,
+)
+
+LEX = {
+    "birds": {
+        "pos": [
+            (W["STRONG"], ["bird","birds","avian","aves","beak","feather","plumage","wing","nest","raptor","songbird","passerine","galliform","anseriform","strigiform","psittaciform","falconidae","accipitridae","columbidae","laridae"]),
+            (W["MED"],    ["hatchling","fledgling","clutch","aviary"])
+        ],
+        "neg": ["spider","arachnid","insect","beetle","frog","toad","snake","lizard","fish","shark","whale","dolphin","mollusk","crab"]
+    },
+    "fish": {
+        "pos": [
+            (W["STRONG"], ["fish","fishes","gill","gills","teleost","actinopterygii","chondrichthyes","ray-finned","cartilaginous","salmonidae","cyprinidae","cichlidae","scombridae","gadidae"]),
+            (W["MED"],    ["schooling","spawn","fry","juvenile fish","lateral line"])
+        ],
+        "neg": ["spider","insect","bird","feather","fur","mammal","snake","lizard","frog","toad","whale","dolphin","octopus","squid","crab","shrimp"]
+    },
+    "marine_animals": {
+        "pos": [
+            (W["STRONG"], ["marine","oceanic","sea lion","seal","walrus","cetacean","whale","dolphin","porpoise",
+                           "mollusk","mollusc","cephalopod","octopus","squid","cuttlefish",
+                           "crustacean","crab","lobster","shrimp","krill","echinoderm","starfish","sea urchin","cnidaria","jellyfish","coral"]),
+            (W["MED"],    ["plankton","benthic","pelagic","reef","coastal"])
+        ],
+        "neg": ["feather","songbird","sparrow","butterfly","spider","snake","lizard","frog","toad","bear","wolf","deer"]
+    },
+    "insects_arachnids": {
+        "pos": [
+            (W["STRONG"], ["insect","insects","arthropod","beetle","coleoptera","diptera","hymenoptera","lepidoptera","hemiptera",
+                           "wasp","ant","bee","butterfly","moth","grasshopper","cricket","dragonfly","termite",
+                           "arachnid","spider","scorpion","acari","tick","mite","araneae"]),
+            (W["MED"],    ["exoskeleton","chitin","thorax","abdomen","ocelli","tracheal spiracle","spinneret"])
+        ],
+        "neg": ["feather","gill","mammal","fur","whale","dolphin","fish","shark","frog","toad","lizard","snake","turtle"]
+    },
+    "mammals": {
+        "pos": [
+            (W["STRONG"], ["mammal","mammalia","fur","hair","whisker","placental","marsupial","monotreme",
+                           "canidae","felidae","bovidae","cervidae","primates","hominidae","rodent","chiroptera","mustelidae","ursus","equidae","suidae"]),
+            (W["MED"],    ["live birth","gestation","lactation","mammary"])
+        ],
+        "neg": ["feather","gill","insect","arachnid","frog","toad","lizard","snake","turtle","octopus","squid","crab","shrimp","jellyfish"]
+    },
+    "reptiles_amphibians": {
+        "pos": [
+            (W["STRONG"], ["reptile","amphibian","herpetology","squamata","serpentes","lizard","gecko","iguana","snake","python","viper",
+                           "testudines","turtle","tortoise","crocodylia","crocodile","alligator",
+                           "amphibia","anura","frog","toad","urodela","salamander","caecilian"]),
+            (W["MED"],    ["scales","ectotherm","metamorphosis","tadpole"])
+        ],
+        "neg": ["feather","songbird","mammal","fur","whale","dolphin","fish","gill","spider","insect","beetle","butterfly","ant"]
+    },
+    "ethology_vet": {
+        "pos": [
+            (W["STRONG"], ["ethology","behavior","behaviour","training","veterinary","veterinarian","pathology","diagnosis","treatment",
+                           "disease","parasite","zoonosis","symptom","clinic","therapy","prognosis","case report"]),
+            (W["MED"],    ["captivity","enrichment","welfare","nutrition","diet","protocol"])
+        ],
+        "neg": []
+    },
+    "prehistoric": {
+        "pos": [
+            (W["STRONG"], ["dinosaur","jurassic","cretaceous","triassic","paleozoic","mesozoic","fossil","fossils",
+                           "trilobite","pterosaurs","plesiosaur","ichthyosaur","archaeopteryx","megafauna"]),
+        ],
+        "neg": []
+    },
+    "mythical": {
+        "pos": [
+            (W["STRONG"], ["mythical","legendary","folklore","dragon","wyvern","griffin","unicorn","phoenix","kraken","werewolf","mermaid","minotaur","pegasus"]),
+        ],
+        "neg": []
+    },
+}
+
+# Mappages latins → catégories (ordres/classes/familles fréquents)
+LATIN_TO_CAT = {
+    # Oiseaux
+    "aves":"birds","passeriformes":"birds","accipitriformes":"birds","falconiformes":"birds","columbiformes":"birds",
+    "anseriformes":"birds","galliformes":"birds","psittaciformes":"birds","strigiformes":"birds",
+    # Poissons
+    "actinopterygii":"fish","teleostei":"fish","chondrichthyes":"fish","elasmobranchii":"fish",
+    # Mammifères
+    "mammalia":"mammals","primates":"mammals","carnivora":"mammals","rodentia":"mammals",
+    "chiroptera":"mammals","artiodactyla":"mammals","perissodactyla":"mammals","lagomorpha":"mammals",
+    # Reptiles/Amphibiens
+    "reptilia":"reptiles_amphibians","squamata":"reptiles_amphibians","serpentes":"reptiles_amphibians",
+    "testudines":"reptiles_amphibians","crocodylia":"reptiles_amphibians",
+    "amphibia":"reptiles_amphibians","anura":"reptiles_amphibians","urodela":"reptiles_amphibians","gymnophiona":"reptiles_amphibians",
+    # Arthropodes Insectes/Arachnides
+    "insecta":"insects_arachnids","arachnida":"insects_arachnids","coleoptera":"insects_arachnids","diptera":"insects_arachnids",
+    "hymenoptera":"insects_arachnids","lepidoptera":"insects_arachnids","hemiptera":"insects_arachnids",
+    "araneae":"insects_arachnids","scorpiones":"insects_arachnids","acari":"insects_arachnids",
+    # Marin (non-poissons)
+    "cephalopoda":"marine_animals","mollusca":"marine_animals","crustacea":"marine_animals","echinodermata":"marine_animals",
+    "cnidaria":"marine_animals","cetacea":"marine_animals","pinnipedia":"marine_animals",
+}
+
+# Poids supplémentaires si l’environnement est clairement marin
+MARINE_HINTS = set(["marine","ocean","sea","pelagic","benthic","reef","coastal","intertidal","estuary"])
+
+def score_text(text: str) -> dict:
+    t = normalize(text)
+    scores = Counter()
+
+    # 1) Boost par termes latins (classes/ordres)
+    for latin, cat in LATIN_TO_CAT.items():
+        if re.search(rf"\b{latin}\b", t):
+            scores[cat] += 2.5  # boost fort
+
+    # 2) Heuristique “milieu marin”
+    if any(h in t for h in MARINE_HINTS):
+        scores["marine_animals"] += 1.0
+
+    # 3) Binominaux (signal animal fort)
+    #    (on ne mappe pas au genre; on se contente d’un léger boost “animal existant”)
+    if BINOMIAL_RE.search(text):
+        # présence d'un binominal → pas "mythical"
+        scores["mythical"] -= 1.0
+
+    # 4) Vocabulaires positifs/négatifs
+    for cat, spec in LEX.items():
+        for w, lst in spec.get("pos", []):
+            for kw in lst:
+                if kw in t:
+                    scores[cat] += w
+        for kw in spec.get("neg", []):
+            if kw in t:
+                scores[cat] -= 0.8  # petite pénalité
+
+    # 5) Règle de priorité Marine vs Fish:
+    # si beaucoup d'indices marins non-poissons, on avantage marine_animals
+    if scores["marine_animals"] >= scores["fish"] + 1.5:
+        scores["marine_animals"] += 0.7
+
+    return scores
+
+def choose_category(scores: Counter):
+    ranked = scores.most_common()
+    if not ranked:
+        return "needs_review", ranked
+    top_cat, top_score = ranked[0]
+    second = ranked[1][1] if len(ranked) > 1 else -999
+    if top_score < SEUIL_MIN or (top_score - second) < MARGE_MIN:
+        return "needs_review", ranked
+    # Évite le tout-insectes si l’écart est faible et qu’un autre groupe a des signaux latins forts
+    if top_cat == "insects_arachnids" and len(ranked) > 1 and ranked[1][1] > 0 and (top_score - ranked[1][1]) < 1.2:
+        # si l’un des autres a au moins un boost latin enregistré plus haut, on re-vérifie
+        pass
+    return top_cat, ranked
+
+def ensure_folders():
+    for d in DEST_SUBFOLDERS:
+        os.makedirs(os.path.join(BASE_DIR, d), exist_ok=True)
+
+def main():
+    src = os.path.join(BASE_DIR, SRC_SUBFOLDER)
+    assert os.path.isdir(src), f"Introuvable: {src}"
+    ensure_folders()
+
+    moved = 0
+    kept = 0
+    per_cat = Counter()
+    ambiguous = []
+
+    files = [f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f))]
+    for i, fname in enumerate(files, 1):
+        fpath = os.path.join(src, fname)
+        head = read_head(fpath)
+        text = (fname + "\n" + head)  # titre + contenu
+        scores = score_text(text)
+        cat, ranked = choose_category(scores)
+
+        # Log ambigus
+        if cat == "needs_review":
+            ambiguous.append((fname, ranked[:4]))
+
+        # Déplacement
+        if not DRY_RUN and cat != "needs_review":
+            dest = os.path.join(BASE_DIR, cat, fname)
+            try:
+                shutil.move(fpath, dest)
+                moved += 1
+                per_cat[cat] += 1
+            except Exception as e:
+                print(f"[WARN] Move échoué pour {fname}: {e}")
+                kept += 1
+        else:
+            # simulation ou on garde volontairement
+            if cat != "needs_review":
+                per_cat[cat] += 1
+            else:
+                kept += 1
+
+        if i % 1000 == 0:
+            print(f"... {i} fichiers traités")
+
+    # Rapport
+    total = len(files)
+    print("\n=== RAPPORT PASS2 ===")
+    print(f"Fichiers analysés : {total}")
+    print(f"Déplacements simulés : {sum(per_cat.values()) if DRY_RUN else moved}")
+    print(f"Restés dans needs_review : {kept}")
+    print("\nRépartition par catégorie (estimation si DRY_RUN):")
+    for cat in DEST_SUBFOLDERS:
+        if cat == "needs_review": continue
+        print(f"  - {cat}: {per_cat[cat]}")
+
+    print("\nExemples de fichiers ambigus (top4 scores) :")
+    for fn, rk in ambiguous[:30]:
+        pretty = ", ".join([f"{c}={s:.1f}" for c, s in rk])
+        print(f"  • {fn}: {pretty}")
+
+if __name__ == "__main__":
+    main()
