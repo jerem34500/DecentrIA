@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Classement en SOUS-CATÉGORIES, catégorie par catégorie (Zero-Shot DeBERTa).
+
+Exemple (comme dans tes captures) :
+  python3 classify_subcats.py \
+    --cats "/home/…/categorie_sous_categorie_en.py" \
+    --category "Animals" \
+    --in_dir "/home/…/classified_semantic/Animals" \
+    --out_root "/home/…/subcats_pass1" \
+    --report "/home/…/animals_subcats_pass1.csv" \
+    --sample 0 \
+    --strip_html \
+    --score_thresh 0.35 \
+    --margin 0.05 \
+    --move_to copy \
+    --model "MoritzLaurer/deberta-v3-large-zeroshot-v2.0" \
+    --device cuda:0 \
+    --batch_size 8
+"""
+
+import os, re, csv, sys, time, glob, html, shutil, argparse, importlib.util
+from pathlib import Path
+from typing import Dict, List, Tuple
+from transformers import pipeline
+
+# ---------- utilitaires ----------
+
+def fail(msg: str):
+    print(f"\n[ERREUR] {msg}\n", file=sys.stderr)
+    sys.exit(1)
+
+def load_categories(py_path: str) -> Dict:
+    p = Path(py_path)
+    if not p.exists():
+        fail(f"--cats ne pointe pas sur un fichier existant : {py_path}")
+    if not p.is_file() or p.suffix != ".py":
+        fail(f"--cats doit être un fichier .py, reçu : {py_path}")
+
+    spec = importlib.util.spec_from_file_location("cats_mod", str(p))
+    if spec is None or spec.loader is None:
+        fail(f"Impossible de charger le module catégories : {py_path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+
+    if not hasattr(mod, "CATEGORIES"):
+        fail("Le module des catégories doit définir CATEGORIES (dict).")
+    cats = getattr(mod, "CATEGORIES")
+    if not isinstance(cats, dict):
+        fail("CATEGORIES doit être un dict {Cat: {subcat: [mots…], …}, …}.")
+    return cats
+
+def read_text(path: str, strip_html: bool = False, max_chars: int = 100_000) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read(max_chars)
+    except Exception:
+        return ""
+    if strip_html:
+        txt = re.sub(r"<script[^>]*>.*?</script>", " ", txt, flags=re.S|re.I)
+        txt = re.sub(r"<style[^>]*>.*?</style>",  " ", txt, flags=re.S|re.I)
+        txt = re.sub(r"<[^>]+>", " ", txt)
+        txt = html.unescape(txt)
+    return txt.strip()
+
+def ensure_dir(p: str) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def make_zs_pipeline(model: str, device: str, batch_size: int):
+    dev = 0 if device.startswith("cuda") else -1
+    return pipeline(
+        "zero-shot-classification",
+        model=model,
+        device=dev,
+        batch_size=batch_size,
+        truncation=True
+    )
+
+def top2_from_result(r) -> Tuple[str, float, float]:
+    # r["labels"] et r["scores"] sont déjà triés desc chez HF
+    label_best  = r["labels"][0] if r["labels"] else ""
+    score_best  = float(r["scores"][0]) if r["scores"] else 0.0
+    score_second = float(r["scores"][1]) if len(r["scores"]) > 1 else 0.0
+    return label_best, score_best, score_second
+
+# ---------- CLI ----------
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Sous-catégorisation (catégorie par catégorie).")
+    p.add_argument("--cats", required=True, help="Module .py avec CATEGORIES")
+    p.add_argument("--category", required=True, help="Catégorie à traiter (ex: 'Animals')")
+    p.add_argument("--in_dir", required=True, help="Dossier source .txt de la catégorie")
+    p.add_argument("--out_root", required=True, help="Racine de sortie")
+    p.add_argument("--report", required=True, help="CSV récapitulatif")
+    p.add_argument("--sample", type=int, default=0, help="Échantillon (0=tout)")
+    p.add_argument("--strip_html", action="store_true")
+    p.add_argument("--score_thresh", type=float, default=0.35, help="Seuil score minimum")
+    p.add_argument("--margin", type=float, default=0.05, help="Marge (best-second) minimum")
+    p.add_argument("--move_to", choices=["copy", "move"], default="copy", help="Copier ou déplacer")
+    p.add_argument("--model", default="MoritzLaurer/deberta-v3-large-zeroshot-v2.0")
+    p.add_argument("--device", default="cuda:0")
+    p.add_argument("--batch_size", type=int, default=8)
+    return p.parse_args()
+
+# ---------- main ----------
+
+def main():
+    args = parse_args()
+
+    # 1) Taxonomie
+    CATS = load_categories(args.cats)
+    if args.category not in CATS:
+        fail(f"La catégorie '{args.category}' n'existe pas dans CATEGORIES.")
+    SUBCATS: Dict[str, List[str]] = CATS[args.category]
+    subcat_names = list(SUBCATS.keys())
+    if not subcat_names:
+        fail(f"Aucune sous-catégorie définie pour '{args.category}'.")
+
+    # 2) Dossiers sortie
+    cat_out = os.path.join(args.out_root, args.category)
+    ensure_dir(cat_out)
+    subcat_dirs = {}
+    for sc in subcat_names:
+        d = os.path.join(cat_out, sc)
+        ensure_dir(d)
+        subcat_dirs[sc] = d
+    nr_dir = os.path.join(cat_out, "needs_review")
+    ensure_dir(nr_dir)
+
+    # 3) Fichiers
+    files = sorted(glob.glob(os.path.join(args.in_dir, "*.txt")))
+    if args.sample and args.sample > 0:
+        files = files[:args.sample]
+    total = len(files)
+    if total == 0:
+        fail(f"Aucun .txt trouvé dans {args.in_dir}")
+
+    # 4) Modèle
+    zs = make_zs_pipeline(args.model, args.device, args.batch_size)
+    labels = subcat_names[:]  # les sous-catégories servent de labels ZS
+
+    # 5) Boucle
+    assigned = 0
+    review = 0
+    done = 0
+    t0 = time.time()
+
+    print(f">> Catégorie : {args.category}")
+    print(f">> Fichiers : {total}")
+    print(f">> Labels  : {', '.join(labels)}")
+
+    with open(args.report, "w", newline="", encoding="utf-8") as fcsv:
+        wr = csv.writer(fcsv)
+        wr.writerow(["path", "status", "best_label", "best_score", "second_score"])
+
+        batch_txts, batch_paths = [], []
+
+        def flush():
+            nonlocal assigned, review, done, batch_txts, batch_paths
+            if not batch_txts: 
+                return
+            res = zs(
+                batch_txts,
+                candidate_labels=labels,
+                multi_label=False,
+                hypothesis_template="This article is mainly about {}."
+            )
+            if isinstance(res, dict):
+                res = [res]
+
+            for r, p in zip(res, batch_paths):
+                best_label, best, second = top2_from_result(r)
+
+                # **Décision** : on utilise bien le **label**, pas le score, pour choisir le dossier
+                if best >= args.score_thresh and (best - second) >= args.margin and best_label in subcat_dirs:
+                    out_dir = subcat_dirs[best_label]
+                    status = "ASSIGNED"
+                    assigned += 1
+                else:
+                    out_dir = nr_dir
+                    status = "REVIEW"
+                    review += 1
+
+                dest = os.path.join(out_dir, os.path.basename(p))
+                try:
+                    if args.move_to == "move":
+                        shutil.move(p, dest)
+                    else:
+                        shutil.copy2(p, dest)
+                except Exception:
+                    pass
+
+                wr.writerow([p, status, best_label, f"{best:.4f}", f"{second:.4f}"])
+                done += 1
+
+                if done % 200 == 0 or done == total:
+                    speed = done / max(1e-6, (time.time() - t0))
+                    print(f"Processed {done}/{total} | {speed:.1f} files/s | ASSIGNED={assigned} REVIEW={review}")
+
+            batch_txts, batch_paths = [], []
+
+        for path in files:
+            txt = read_text(path, strip_html=args.strip_html)
+            if not txt:
+                # texte vide → review direct
+                try:
+                    if args.move_to == "move":
+                        shutil.move(path, os.path.join(nr_dir, os.path.basename(path)))
+                    else:
+                        shutil.copy2(path, os.path.join(nr_dir, os.path.basename(path)))
+                except Exception:
+                    pass
+                wr.writerow([path, "REVIEW", "", "0.0000", "0.0000"])
+                review += 1
+                done += 1
+                continue
+
+            batch_txts.append(txt)
+            batch_paths.append(path)
+
+            if len(batch_txts) >= args.batch_size:
+                flush()
+
+        flush()  # reste
+
+    speed = total / max(1e-6, (time.time() - t0))
+    print("== RÉSUMÉ ==")
+    print(f"Traités   : {total}")
+    print(f"ASSIGNED : {assigned}")
+    print(f"REVIEW   : {review}")
+    print(f"Sorties  : {cat_out}/<sous-catégories>  et  {nr_dir}")
+    print(f"Vitesse  : {speed:.1f} files/s")
+
+if __name__ == "__main__":
+    main()
