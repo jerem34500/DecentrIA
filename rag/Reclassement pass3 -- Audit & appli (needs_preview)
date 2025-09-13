@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+PASS3 — AUDIT & APPLY (déplacement optionnel avec --apply)
+Scope strict : BASE_DIR/subcats_pass1/Animals/needs_review
+
+Règles :
+- Exceptions "non-bio" (culture, sport, lieu, org, tech) -> restent en needs_review sauf taxonomie claire
+- "Preuve bio" obligatoire pour insects_arachnids si petit mot (ant/bee/wasp/tick/mite/moth/spider) :
+  * mots entiers + proximité (±80 chars) d'un terme taxonomique/famille/ordre
+- Priorité taxonomique (Aves/Mammalia/Reptilia/Amphibia/Actinopterygii/Insecta/Arachnida + familles/ordres)
+- Par défaut = AUDIT (aucun déplacement). Utiliser --apply pour déplacer.
+- Génère : rapport terminal + CSV (toutes lignes) + manifest des déplacements (si --apply)
+
+Usage :
+    python3 animals_pass3_apply.py            # audit only
+    python3 animals_pass3_apply.py --apply    # applique les déplacements
+"""
+
+import os, re, csv, unicodedata, argparse, shutil, time
+from collections import Counter, defaultdict
+
+# ========================= [PARAMÈTRES UTILISATEUR] ===========================
+BASE_DIR = "/home/jerem/Bureau/DecentrIA/DecentrIA_NEW_RAG/zim_extract/work/subcats_pass1/Animals"
+SRC_SUBFOLDER = "needs_review"
+READ_BYTES = 200_000
+CSV_PATH = "needs_review_report.csv"
+TXT_PATH = "needs_review_examples.txt"
+MOVE_MANIFEST = f"needs_review_moves_{int(time.time())}.csv"   # manifest des déplacements
+# ==============================================================================
+
+DEST_SUBFOLDERS = [
+    "birds","fish","insects_arachnids","mammals","marine_animals",
+    "reptiles_amphibians","ethology_vet","prehistoric","mythical","needs_review"
+]
+
+def norm(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+def lower(text: str) -> str:
+    return text.lower()
+
+def read_head(path: str, nbytes=READ_BYTES) -> str:
+    try:
+        with open(path, "rb") as f:
+            blob = f.read(nbytes)
+        try:
+            return blob.decode("utf-8", errors="ignore")
+        except:
+            return blob.decode("latin-1", errors="ignore")
+    except Exception:
+        return ""
+
+# ---------- Taxonomie forte (classes / ordres / familles fréquents) -----------
+TAXO_TO_CAT = {
+    # Birds
+    "aves":"birds","passeriformes":"birds","accipitriformes":"birds","falconiformes":"birds","columbiformes":"birds",
+    "anseriformes":"birds","galliformes":"birds","psittaciformes":"birds","strigiformes":"birds","charadriiformes":"birds",
+    "accipitridae":"birds","falconidae":"birds","laridae":"birds","columbidae":"birds","anatidae":"birds",
+    # Mammals
+    "mammalia":"mammals","carnivora":"mammals","primates":"mammals","rodentia":"mammals","chiroptera":"mammals",
+    "artiodactyla":"mammals","perissodactyla":"mammals","lagomorpha":"mammals",
+    "felidae":"mammals","canidae":"mammals","bovidae":"mammals","cervidae":"mammals","hominidae":"mammals",
+    # Reptiles / Amphibians
+    "reptilia":"reptiles_amphibians","squamata":"reptiles_amphibians","serpentes":"reptiles_amphibians",
+    "testudines":"reptiles_amphibians","crocodylia":"reptiles_amphibians",
+    "amphibia":"reptiles_amphibians","anura":"reptiles_amphibians","urodela":"reptiles_amphibians","gymnophiona":"reptiles_amphibians",
+    # Fish
+    "actinopterygii":"fish","teleostei":"fish","chondrichthyes":"fish","elasmobranchii":"fish",
+    "salmonidae":"fish","cyprinidae":"fish","cichlidae":"fish","scombridae":"fish","gadidae":"fish",
+    # Insects / Arachnids
+    "insecta":"insects_arachnids","arachnida":"insects_arachnids",
+    "coleoptera":"insects_arachnids","diptera":"insects_arachnids","hymenoptera":"insects_arachnids",
+    "lepidoptera":"insects_arachnids","hemiptera":"insects_arachnids","orthoptera":"insects_arachnids","odonata":"insects_arachnids",
+    "araneae":"insects_arachnids","scorpiones":"insects_arachnids","acari":"insects_arachnids","ixodida":"insects_arachnids",
+    "formicidae":"insects_arachnids","apidae":"insects_arachnids","vespidae":"insects_arachnids","ixodidae":"insects_arachnids",
+    # Marine non-fish
+    "cetacea":"marine_animals","pinnipedia":"marine_animals",
+    "mollusca":"marine_animals","cephalopoda":"marine_animals","crustacea":"marine_animals",
+    "echinodermata":"marine_animals","cnidaria":"marine_animals",
+}
+
+NON_BIO = {
+    "culture": [
+        "album","single","track","ep","lp","band","label","billboard","chart",
+        "film","movie","tv series","episode","season","studio","director","actor",
+        "comic","superhero","marvel","dc","spider-man","spiderman"
+    ],
+    "sport": [
+        "team","club","league","coach","roster","season record","stadium","arena","mascot",
+        "nba","ncaa","premier league","hornets","wasps","bees"
+    ],
+    "lieu": [
+        "city","town","village","municipality","county","province","state",
+        "lake","river","bay","cave","hill","mountain","valley","island",
+        "park","reserve","sanctuary","forest","trail","national park"
+    ],
+    "org": [
+        "company","corporation","inc.","ltd","llc","brand","trademark","foundation","institute","university"
+    ],
+    "tech": [
+        "web spider","crawler","indexer","bot","spider bot","spidering",
+        "etf","spdr","spider etf","model","device","aircraft","ship","hms","uss"
+    ],
+}
+
+SMALL_INSECT_WORDS = [
+    r"\bants?\b", r"\bbees?\b", r"\bwasps?\b", r"\bticks?\b", r"\bmites?\b",
+    r"\bmoths?\b", r"\bspiders?\b", r"\bdragonflies\b", r"\bdragonfly\b", r"\bbutterflies\b", r"\bbutterfly\b"
+]
+SMALL_INSECT_RE = [re.compile(p) for p in SMALL_INSECT_WORDS]
+NEAR_WINDOW = 80
+TAXO_CONTEXT_TERMS = [
+    "species","genus","family","order","class","subfamily","tribe","binomial","taxonomy","taxonomic"
+] + list(TAXO_TO_CAT.keys())
+
+def has_non_bio(text_lc: str) -> str | None:
+    for reason, keys in NON_BIO.items():
+        for k in keys:
+            if k in text_lc:
+                return reason
+    return None
+
+def detect_taxo_targets(text_lc: str) -> Counter:
+    cnt = Counter()
+    for token, cat in TAXO_TO_CAT.items():
+        if re.search(rf"\b{re.escape(token)}\b", text_lc):
+            cnt[cat] += 1
+    return cnt
+
+def small_insect_with_context(text: str) -> bool:
+    t = norm(text); tl = lower(t)
+    for rx in SMALL_INSECT_RE:
+        for m in rx.finditer(tl):
+            a = max(0, m.start() - NEAR_WINDOW)
+            b = min(len(tl), m.end() + NEAR_WINDOW)
+            window = tl[a:b]
+            for ctx in TAXO_CONTEXT_TERMS:
+                if re.search(rf"\b{re.escape(ctx)}\b", window):
+                    return True
+    return False
+
+def suggest_category(text: str):
+    """Retourne (suggested_category|None, reason, debug_decision, taxo_counts_dict)"""
+    t = norm(text); tl = lower(t)
+
+    non_bio_reason = has_non_bio(tl)
+    taxo_counts = detect_taxo_targets(tl)
+
+    if non_bio_reason and not taxo_counts:
+        return None, f"non_bio:{non_bio_reason}", f"needs_review (non_bio:{non_bio_reason})", dict(taxo_counts)
+
+    if taxo_counts:
+        cat, _ = taxo_counts.most_common(1)[0]
+        return cat, "proposé", f"taxo->{cat}", dict(taxo_counts)
+
+    if small_insect_with_context(t):
+        return "insects_arachnids", "proposé", "small_word+context -> insects_arachnids", dict(taxo_counts)
+
+    return None, "faible_signal", "needs_review (faible_signal)", dict(taxo_counts)
+
+def ensure_folders(base):
+    for d in DEST_SUBFOLDERS:
+        os.makedirs(os.path.join(base, d), exist_ok=True)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true", help="Applique les déplacements (sinon audit-only).")
+    args = parser.parse_args()
+    APPLY = args.apply
+
+    src = os.path.join(BASE_DIR, SRC_SUBFOLDER)
+    if not os.path.isdir(src):
+        raise SystemExit(f"Introuvable : {src}")
+    ensure_folders(BASE_DIR)
+
+    files = [f for f in os.listdir(src) if os.path.isfile(os.path.join(src, f))]
+    total = len(files)
+
+    reasons_counter = Counter()
+    suggest_counter = Counter()
+    examples_by_reason = defaultdict(list)
+    top_taxa_by_cat = defaultdict(Counter)
+    smallword_hits_by_cat = Counter()
+    rows_for_csv = []
+    moves_manifest = []
+
+    print("=== PASS3 AUDIT{} — needs_review seulement ===".format(" + APPLY" if APPLY else ""))
+    print(f"Dossier : {src}")
+    print(f"Fichiers analysés : {total}\n")
+
+    for i, fname in enumerate(files, 1):
+        fpath = os.path.join(src, fname)
+        content = read_head(fpath, READ_BYTES)
+        text = fname + "\n" + content
+
+        suggested, reason, decision, taxo_counts = suggest_category(text)
+        reasons_counter[reason] += 1
+        if suggested: suggest_counter[suggested] += 1
+
+        # top taxons (pour audit)
+        if suggested:
+            tl = lower(text)
+            for token, cat in TAXO_TO_CAT.items():
+                if re.search(rf"\b{re.escape(token)}\b", tl) and cat == suggested:
+                    top_taxa_by_cat[suggested][token] += 1
+
+        if decision.startswith("small_word+context"):
+            smallword_hits_by_cat["insects_arachnids"] += 1
+
+        if len(examples_by_reason[reason]) < 20:
+            examples_by_reason[reason].append((fname, decision))
+
+        row = {"filename": fname, "reason": reason, "suggested_category": suggested or "", "decision": decision}
+        for cat in ["birds","mammals","reptiles_amphibians","fish","marine_animals","insects_arachnids"]:
+            row[f"taxo_hits_{cat}"] = taxo_counts.get(cat, 0)
+        rows_for_csv.append(row)
+
+        # APPLY: déplacer si proposé
+        if APPLY and suggested:
+            src_path = fpath
+            dst_path = os.path.join(BASE_DIR, suggested, fname)
+            try:
+                shutil.move(src_path, dst_path)
+                moves_manifest.append((fname, suggested))
+            except Exception as e:
+                # On loggue l’erreur mais on continue
+                moves_manifest.append((fname, f"ERROR:{e}"))
+
+        if i % 2000 == 0:
+            print(f"... {i}/{total} fichiers traités")
+
+    # === RAPPORT TERMINAL =====================================================
+    print("\n=== SYNTHÈSE — raisons de rester en needs_review ===")
+    tot_needs = reasons_counter["faible_signal"] + sum(v for k,v in reasons_counter.items() if k.startswith("non_bio:"))
+    for k, v in reasons_counter.most_common():
+        if k == "proposé":  # pas un blocage
+            continue
+        pct = (v / total) * 100 if total else 0.0
+        print(f"  - {k:20s}: {v:6d}  ({pct:5.1f}%)")
+    print(f"  => Total vrais 'needs_review' (hors propositions): {tot_needs} / {total}")
+
+    print("\n=== PROPOSITIONS DE DESTINATION {} ===".format("(APPLIQUÉES)" if APPLY else "(aucun déplacement)"))
+    for cat, n in suggest_counter.most_common():
+        pct = (n / total) * 100 if total else 0.0
+        print(f"  - {cat:20s}: {n:6d}  ({pct:5.1f}%)")
+
+    print("\n=== TOP TAXONS DÉTECTÉS PAR CATÉGORIE PROPOSÉE ===")
+    for cat in ["birds","mammals","reptiles_amphibians","fish","marine_animals","insects_arachnids"]:
+        cnt = top_taxa_by_cat.get(cat, Counter())
+        if not cnt: continue
+        top10 = ", ".join([f"{tok}×{c}" for tok, c in cnt.most_common(10)])
+        print(f"  {cat:20s}: {top10}")
+
+    if smallword_hits_by_cat["insects_arachnids"]:
+        print("\nNote: insects_arachnids validés par 'petit mot + contexte taxonomique':",
+              smallword_hits_by_cat["insects_arachnids"])
+
+    print("\n=== EXEMPLES (max 20 par motif) ===")
+    for reason, items in examples_by_reason.items():
+        print(f"\n-- {reason} --")
+        for fn, why in items:
+            print(f"  • {fn} — {why}")
+
+    # === EXPORTS ==============================================================
+    if rows_for_csv:
+        try:
+            with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows_for_csv[0].keys()))
+                w.writeheader()
+                w.writerows(rows_for_csv)
+            print(f"\nCSV écrit : {CSV_PATH}")
+        except Exception as e:
+            print(f"\n[WARN] Écriture CSV échouée : {e}")
+
+    if APPLY and moves_manifest:
+        try:
+            with open(MOVE_MANIFEST, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["filename","moved_to_or_error"])
+                w.writerows(moves_manifest)
+            print(f"Manifest des déplacements : {MOVE_MANIFEST}")
+        except Exception as e:
+            print(f"[WARN] Écriture manifest échouée : {e}")
+
+if __name__ == "__main__":
+    main()
